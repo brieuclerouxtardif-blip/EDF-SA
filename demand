@@ -1,0 +1,85 @@
+# ============================================================
+# demand.py — Modèle de demande électrique
+# ============================================================
+
+import numpy as np
+from config import DEMAND, HOURS, rng
+
+
+def simulate_demand() -> np.ndarray:
+    """
+    Demande horaire (MW) = base + saisonnalité + intra-journalier + bruit
+
+    Trois composantes :
+    1. Saisonnière : plus forte en hiver (chauffage), plus faible en été
+    2. Intra-journalière : pic matin + pic soir, creux nuit
+    3. Bruit gaussien : aléa météo, comportemental
+    """
+    hours = np.arange(HOURS)
+    t_year = hours / HOURS                      # [0, 1] fraction d'année
+    t_day  = (hours % 24) / 24                 # [0, 1] fraction de journée
+
+    # Saisonnalité : hiver fort, été faible (cosinus décalé)
+    seasonal = DEMAND["amplitude"] * 0.5 * (1 + np.cos(2 * np.pi * t_year))
+
+    # Profil intra-journalier : deux pics (8h et 19h)
+    daily = (
+        0.12 * np.sin(2 * np.pi * (t_day - 0.33)) +   # pic matin
+        0.08 * np.sin(4 * np.pi * (t_day - 0.10))      # pic soir
+    ) * DEMAND["base"]
+
+    # Bruit stochastique
+    noise = rng.normal(0, DEMAND["noise_std"], HOURS)
+
+    demand = DEMAND["base"] + seasonal + daily + noise
+    return np.clip(demand, 20_000, 100_000)   # bornes physiques réalistes
+
+
+# ============================================================
+# renewables.py — Profils éolien et solaire
+# ============================================================
+
+def simulate_wind(capacity_mw: float) -> np.ndarray:
+    """
+    Production éolienne (MW).
+    Facteur de charge moyen ~25%, avec variabilité stochastique
+    et saisonnalité (vent plus fort en hiver).
+    """
+    hours = np.arange(HOURS)
+    t_year = hours / HOURS
+
+    # Facteur de charge de base avec saisonnalité hivernale
+    cf_base = 0.25 + 0.10 * np.cos(2 * np.pi * t_year + np.pi)
+
+    # Variabilité courte (bruit corrélé sur 6h)
+    raw_noise = rng.standard_normal(HOURS)
+    # Lissage simple (moyenne glissante 6h = corrélation temporelle)
+    noise = np.convolve(raw_noise, np.ones(6)/6, mode='same') * 0.15
+
+    cf = np.clip(cf_base + noise, 0.0, 1.0)
+    return cf * capacity_mw
+
+
+def simulate_solar(capacity_mw: float) -> np.ndarray:
+    """
+    Production solaire (MW).
+    Profil déterministe jour/nuit + saisonnalité estivale.
+    Nulle la nuit par construction.
+    """
+    hours = np.arange(HOURS)
+    t_year = hours / HOURS
+    hour_of_day = hours % 24
+
+    # Saisonnalité : été fort
+    seasonal_cf = 0.5 + 0.5 * np.cos(2 * np.pi * (t_year - 0.5))
+
+    # Profil journalier : cloche centrée sur 13h
+    solar_angle = np.maximum(
+        np.sin(np.pi * (hour_of_day - 6) / 12), 0
+    )   # positif entre 6h et 18h
+
+    # Bruit nuageux
+    cloud_noise = np.clip(rng.beta(5, 2, HOURS), 0, 1)
+
+    cf = seasonal_cf * solar_angle * cloud_noise
+    return np.clip(cf, 0, 1) * capacity_mw
