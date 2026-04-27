@@ -1,0 +1,43 @@
+# ============================================================
+# commodities.py — Processus stochastiques TTF & EUA
+# ============================================================
+
+import numpy as np
+from config import TTF, EUA, HOURS, DT, rng
+
+
+def ornstein_uhlenbeck(params: dict, n_steps: int) -> np.ndarray:
+    """
+    Simule un processus Ornstein-Uhlenbeck discret :
+        dX = kappa*(mu - X)*dt + sigma*sqrt(dt)*dW
+
+    Utilisé pour le gaz (TTF) et le CO2 (EUA) :
+    - mean-reversion vers un niveau d'équilibre fondamental
+    - volatilité stochastique autour de cet équilibre
+    """
+    mu    = params["mu"]
+    kappa = params["kappa"]
+    sigma = params["sigma"]
+    X0    = params["S0"]
+
+    X = np.zeros(n_steps)
+    X[0] = X0
+    dW = rng.standard_normal(n_steps) * np.sqrt(DT)
+
+    for t in range(1, n_steps):
+        drift    = kappa * (mu - X[t-1]) * DT
+        diffusion = sigma * dW[t]
+        X[t]     = X[t-1] + drift + diffusion
+        X[t]     = max(X[t], 1.0)   # prix toujours positif
+
+    return X
+
+
+def simulate_ttf() -> np.ndarray:
+    """Prix du gaz TTF (€/MWh_gaz) sur l'horizon de simulation."""
+    return ornstein_uhlenbeck(TTF, HOURS)
+
+
+def simulate_eua() -> np.ndarray:
+    """Prix du quota CO2 EUA (€/tCO2) sur l'horizon de simulation."""
+    return ornstein_uhlenbeck(EUA, HOURS)
