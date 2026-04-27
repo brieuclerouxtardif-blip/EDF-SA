@@ -1,0 +1,76 @@
+# ============================================================
+# forward_market.py — Marché à terme (courbe forward)
+# ============================================================
+
+import numpy as np
+from config import FORWARD
+
+
+def compute_forward_curve(
+    spot_price: np.ndarray,
+    tenors_months: list[int] | None = None,
+) -> dict:
+    """
+    Calcule les prix forward pour différents tenors.
+
+    Modèle simplifié :
+        F(t, T) = E[S_T | F_t] + prime_de_risque
+
+    En pratique : prix forward = moyenne du spot sur la fenêtre future
+    + prime de risque (les acheteurs paient une prime pour la certitude)
+
+    Returns
+    -------
+    dict : {tenor_mois: prix_forward_annuel (np.ndarray)}
+    """
+    if tenors_months is None:
+        tenors_months = FORWARD["tenors"]
+
+    risk_premium = FORWARD["risk_premium"]
+    hours_per_month = 8760 // 12
+    n = len(spot_price)
+    curves = {}
+
+    for tenor in tenors_months:
+        window = tenor * hours_per_month
+        forward = np.zeros(n)
+
+        for h in range(n):
+            end = min(h + window, n)
+            # Prix forward = anticipation du spot sur la période + prime
+            forward[h] = np.mean(spot_price[h:end]) + risk_premium
+
+        curves[f"M+{tenor}"] = forward
+
+    return curves
+
+
+def baseload_price(spot_price: np.ndarray, period: str = "annual") -> float:
+    """
+    Prix baseload = moyenne arithmétique du spot sur la période.
+    C'est le prix de référence des contrats annuels (Cal+1).
+    """
+    if period == "annual":
+        return float(np.mean(spot_price))
+    elif period == "summer":
+        # Avril → Septembre (heures 2160 à 6552)
+        return float(np.mean(spot_price[2160:6552]))
+    elif period == "winter":
+        s1 = np.mean(spot_price[:2160])
+        s2 = np.mean(spot_price[6552:])
+        return float((s1 + s2) / 2)
+    return float(np.mean(spot_price))
+
+
+def peakload_price(spot_price: np.ndarray) -> float:
+    """
+    Prix peakload = moyenne du spot aux heures de pointe.
+    Heures de pointe : 8h–20h, jours ouvrés (lundi–vendredi).
+    Approximation : heures 8–20 de chaque journée.
+    """
+    hours = np.arange(len(spot_price))
+    hour_of_day = hours % 24
+    day_of_week = (hours // 24) % 7   # 0=lundi, 6=dimanche
+
+    peak_mask = (hour_of_day >= 8) & (hour_of_day < 20) & (day_of_week < 5)
+    return float(np.mean(spot_price[peak_mask]))
