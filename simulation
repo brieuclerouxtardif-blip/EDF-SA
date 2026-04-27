@@ -1,0 +1,233 @@
+# ============================================================
+# simulation.py — Orchestrateur principal + visualisations
+# ============================================================
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__))
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.ticker import FuncFormatter
+
+from config      import CAPACITIES, HOURS
+from commodities import simulate_ttf, simulate_eua
+from demand      import simulate_demand, simulate_wind, simulate_solar
+from merit_order import compute_variable_costs, run_merit_order
+from forward_market import compute_forward_curve, baseload_price, peakload_price
+
+
+# ─── Style ────────────────────────────────────────────────────────────────────
+COLORS = {
+    "nuclear": "#3B4FBF",
+    "wind":    "#2ECC71",
+    "solar":   "#F39C12",
+    "hydro":   "#1ABC9C",
+    "gas":     "#E74C3C",
+    "coal":    "#7F8C8D",
+    "oil":     "#8E44AD",
+    "spot":    "#ECF0F1",
+    "demand":  "#F1C40F",
+    "ttf":     "#E67E22",
+    "eua":     "#16A085",
+    "forward": "#3498DB",
+}
+
+BG      = "#0D1117"
+GRID_C  = "#1E2530"
+TEXT_C  = "#C9D1D9"
+
+
+def fmt_mwh(x, _):
+    return f"{x/1000:.0f} GW"
+
+def fmt_eur(x, _):
+    return f"{x:.0f} €"
+
+
+def run_simulation():
+    print("=" * 60)
+    print("  SIMULATION MARCHÉS DE L'ÉNERGIE — 1 AN HORAIRE")
+    print("=" * 60)
+
+    # ── 1. Commodités ────────────────────────────────────────
+    print("\n[1/5] Simulation des prix de commodités...")
+    ttf = simulate_ttf()
+    eua = simulate_eua()
+    print(f"      TTF  — moy: {ttf.mean():.1f}  min: {ttf.min():.1f}  max: {ttf.max():.1f}  €/MWh_gaz")
+    print(f"      EUA  — moy: {eua.mean():.1f}  min: {eua.min():.1f}  max: {eua.max():.1f}  €/tCO2")
+
+    # ── 2. Demande & ENR ─────────────────────────────────────
+    print("\n[2/5] Simulation de la demande et des ENR...")
+    demand = simulate_demand()
+    wind   = simulate_wind(CAPACITIES["wind"])
+    solar  = simulate_solar(CAPACITIES["solar"])
+    print(f"      Demande — moy: {demand.mean()/1000:.1f} GW")
+    print(f"      Éolien  — moy: {wind.mean()/1000:.1f} GW  (cf: {wind.mean()/CAPACITIES['wind']:.1%})")
+    print(f"      Solaire — moy: {solar.mean()/1000:.1f} GW  (cf: {solar.mean()/CAPACITIES['solar']:.1%})")
+
+    # ── 3. Merit order → prix spot ───────────────────────────
+    print("\n[3/5] Calcul du merit order et prix spot...")
+    costs = compute_variable_costs(ttf, eua)
+    spot, dispatch = run_merit_order(demand, wind, solar, costs)
+    print(f"      Spot — moy: {spot.mean():.1f}  min: {spot.min():.1f}  max: {spot.max():.1f}  €/MWh")
+    neg_pct = (spot < 0).mean() * 100
+    print(f"      Heures de prix négatifs : {neg_pct:.1f}%")
+
+    # ── 4. Marché forward ────────────────────────────────────
+    print("\n[4/5] Calcul de la courbe forward...")
+    forward_curves = compute_forward_curve(spot)
+    bl  = baseload_price(spot)
+    pl  = peakload_price(spot)
+    spread = pl - bl
+    print(f"      Baseload annuel : {bl:.1f} €/MWh")
+    print(f"      Peakload annuel : {pl:.1f} €/MWh")
+    print(f"      Peak/Base spread : {spread:.1f} €/MWh")
+
+    # ── 5. Visualisations ────────────────────────────────────
+    print("\n[5/5] Génération des graphiques...")
+    _plot_dashboard(ttf, eua, demand, wind, solar, spot, dispatch, forward_curves)
+    print("\n✓ Simulation terminée.")
+    return {
+        "ttf": ttf, "eua": eua,
+        "demand": demand, "wind": wind, "solar": solar,
+        "spot": spot, "dispatch": dispatch,
+        "forward": forward_curves,
+        "baseload": bl, "peakload": pl,
+    }
+
+
+def _plot_dashboard(ttf, eua, demand, wind, solar, spot, dispatch, forward_curves):
+    hours = np.arange(HOURS)
+    days  = hours / 24
+
+    fig = plt.figure(figsize=(22, 16), facecolor=BG)
+    gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.32)
+
+    ax_style = dict(facecolor=BG, tick_params=dict(colors=TEXT_C),
+                    label_params=dict(color=TEXT_C))
+
+    def style_ax(ax, title, xlabel="", ylabel=""):
+        ax.set_facecolor(BG)
+        ax.tick_params(colors=TEXT_C)
+        ax.set_title(title, color=TEXT_C, fontsize=10, fontweight="bold", pad=8)
+        ax.set_xlabel(xlabel, color=TEXT_C, fontsize=8)
+        ax.set_ylabel(ylabel, color=TEXT_C, fontsize=8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor(GRID_C)
+        ax.grid(color=GRID_C, linewidth=0.5, alpha=0.8)
+        ax.set_xlim(days[0], days[-1])
+
+    # ─ Panel 1 : Prix spot (annuel) ─
+    ax1 = fig.add_subplot(gs[0, :2])
+    # Moyenne mobile 24h pour lisibilité
+    spot_ma = np.convolve(spot, np.ones(24)/24, mode='same')
+    ax1.fill_between(days, spot, alpha=0.25, color=COLORS["spot"])
+    ax1.plot(days, spot_ma, color=COLORS["spot"], lw=1.2, label="Spot MA-24h")
+    ax1.axhline(spot.mean(), color="#E74C3C", lw=1, ls="--", label=f"Moy {spot.mean():.0f} €")
+    ax1.axhline(0, color="#555", lw=0.8, ls=":")
+    style_ax(ax1, "Prix spot électricité (€/MWh)", "Jours", "€/MWh")
+    ax1.legend(fontsize=8, facecolor=BG, labelcolor=TEXT_C, framealpha=0.4)
+
+    # ─ Panel 2 : Distribution spot ─
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.hist(spot, bins=80, color=COLORS["spot"], alpha=0.7,
+             orientation="horizontal", density=True)
+    ax2.axhline(spot.mean(), color="#E74C3C", lw=1.2, ls="--")
+    style_ax(ax2, "Distribution du spot", "Densité", "€/MWh")
+    ax2.set_xlim(left=0)
+
+    # ─ Panel 3 : TTF & EUA ─
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3_twin = ax3.twinx()
+    ax3.plot(days, ttf, color=COLORS["ttf"], lw=0.9, label="TTF (€/MWh_gaz)")
+    ax3_twin.plot(days, eua, color=COLORS["eua"], lw=0.9, label="EUA (€/tCO2)")
+    ax3_twin.tick_params(colors=TEXT_C)
+    ax3_twin.spines["right"].set_edgecolor(GRID_C)
+    ax3_twin.yaxis.label.set_color(TEXT_C)
+    style_ax(ax3, "Commodités : TTF & EUA", "Jours", "€/MWh_gaz")
+    ax3.legend(fontsize=7, facecolor=BG, labelcolor=TEXT_C, loc="upper left", framealpha=0.4)
+    ax3_twin.legend(fontsize=7, facecolor=BG, labelcolor=TEXT_C, loc="upper right", framealpha=0.4)
+
+    # ─ Panel 4 : Mix de production (semaine type hiver) ─
+    ax4 = fig.add_subplot(gs[1, 1])
+    h_start, h_end = 24*10, 24*17   # semaine représentative hiver
+    h_slice = np.arange(h_start, h_end)
+    techs_stack = ["nuclear", "hydro", "wind", "solar", "coal", "gas", "oil"]
+    bottom = np.zeros(len(h_slice))
+    for tech in techs_stack:
+        vals = dispatch[tech][h_slice]
+        ax4.fill_between(h_slice - h_start, bottom, bottom + vals/1000,
+                         alpha=0.85, label=tech, color=COLORS[tech])
+        bottom += vals / 1000
+    ax4.plot(h_slice - h_start, demand[h_slice]/1000,
+             color=COLORS["demand"], lw=1.5, ls="--", label="Demande")
+    style_ax(ax4, "Mix de production — semaine hiver (GW)", "Heure", "GW")
+    ax4.legend(fontsize=6.5, facecolor=BG, labelcolor=TEXT_C,
+               ncol=2, framealpha=0.4)
+
+    # ─ Panel 5 : Mix de production (semaine type été) ─
+    ax5 = fig.add_subplot(gs[1, 2])
+    h_start_s, h_end_s = 24*180, 24*187   # été
+    h_slice_s = np.arange(h_start_s, h_end_s)
+    bottom_s = np.zeros(len(h_slice_s))
+    for tech in techs_stack:
+        vals = dispatch[tech][h_slice_s]
+        ax5.fill_between(h_slice_s - h_start_s, bottom_s, bottom_s + vals/1000,
+                         alpha=0.85, color=COLORS[tech])
+        bottom_s += vals / 1000
+    ax5.plot(h_slice_s - h_start_s, demand[h_slice_s]/1000,
+             color=COLORS["demand"], lw=1.5, ls="--")
+    style_ax(ax5, "Mix de production — semaine été (GW)", "Heure", "GW")
+
+    # ─ Panel 6 : Coût marginal gaz vs spot ─
+    ax6 = fig.add_subplot(gs[2, 0])
+    from merit_order import compute_variable_costs
+    costs_full = compute_variable_costs(ttf, eua)
+    ax6.plot(days, costs_full["gas"], color=COLORS["gas"], lw=0.8, alpha=0.8, label="CV Gaz")
+    ax6.plot(days, costs_full["coal"], color=COLORS["coal"], lw=0.8, alpha=0.8, label="CV Charbon")
+    spot_ma2 = np.convolve(spot, np.ones(48)/48, mode='same')
+    ax6.plot(days, spot_ma2, color=COLORS["spot"], lw=1, ls="--", label="Spot MA-48h")
+    style_ax(ax6, "Coûts marginaux vs spot (€/MWh)", "Jours", "€/MWh")
+    ax6.legend(fontsize=7, facecolor=BG, labelcolor=TEXT_C, framealpha=0.4)
+
+    # ─ Panel 7 : Courbe forward M+1 à M+12 ─
+    ax7 = fig.add_subplot(gs[2, 1])
+    colors_fwd = ["#3498DB", "#9B59B6", "#1ABC9C", "#E74C3C"]
+    for i, (tenor, fwd) in enumerate(forward_curves.items()):
+        fwd_ma = np.convolve(fwd, np.ones(168)/168, mode='same')
+        ax7.plot(days, fwd_ma, lw=1.1, label=tenor, color=colors_fwd[i % 4])
+    ax7.plot(days, spot_ma2, color=COLORS["spot"], lw=0.8, ls=":", alpha=0.6, label="Spot")
+    style_ax(ax7, "Courbe forward (€/MWh)", "Jours", "€/MWh")
+    ax7.legend(fontsize=7, facecolor=BG, labelcolor=TEXT_C, framealpha=0.4)
+
+    # ─ Panel 8 : ENR vs demande résiduelle ─
+    ax8 = fig.add_subplot(gs[2, 2])
+    enr_total = wind + solar
+    residual  = demand - enr_total
+    enr_ma    = np.convolve(enr_total, np.ones(168)/168, mode='same') / 1000
+    res_ma    = np.convolve(residual,  np.ones(168)/168, mode='same') / 1000
+    dem_ma    = np.convolve(demand,    np.ones(168)/168, mode='same') / 1000
+    ax8.fill_between(days, enr_ma, alpha=0.4, color="#2ECC71", label="ENR")
+    ax8.plot(days, dem_ma, color=COLORS["demand"], lw=1, label="Demande")
+    ax8.plot(days, res_ma, color="#E74C3C", lw=1, ls="--", label="Résiduelle")
+    style_ax(ax8, "ENR & demande résiduelle (GW, MA-1sem)", "Jours", "GW")
+    ax8.legend(fontsize=7, facecolor=BG, labelcolor=TEXT_C, framealpha=0.4)
+
+    # ─ Titre global ─
+    fig.suptitle(
+        "SIMULATION MARCHÉS DE L'ÉNERGIE — FRANCE — 1 AN",
+        color=TEXT_C, fontsize=14, fontweight="bold", y=0.98
+    )
+
+    out = "/mnt/user-data/outputs/energy_market_simulation.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=BG)
+    plt.close()
+    print(f"      Dashboard sauvegardé → {out}")
+
+
+if __name__ == "__main__":
+    results = run_simulation()
