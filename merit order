@@ -1,0 +1,111 @@
+# ============================================================
+# merit_order.py — Formation du prix spot par merit order
+# ============================================================
+
+import numpy as np
+from config import CAPACITIES, VARIABLE_COSTS, THERMAL, AVAILABILITY
+
+
+def compute_variable_costs(ttf: np.ndarray, eua: np.ndarray) -> dict:
+    """
+    Calcule les coûts variables dynamiques pour les thermiques.
+
+    Pour une centrale thermique :
+        CV (€/MWh_elec) = prix_combustible / rendement
+                         + facteur_emission * prix_CO2
+    """
+    n = len(ttf)
+
+    # Gaz
+    gas_fuel_cost = ttf / THERMAL["gas"]["efficiency"]
+    gas_co2_cost  = THERMAL["gas"]["emission_factor"] * eua
+    cv_gas        = gas_fuel_cost + gas_co2_cost
+
+    # Charbon (prix charbon ~ TTF * 0.35 en équivalent énergétique)
+    coal_price    = ttf * 0.35
+    coal_fuel_cost = coal_price / THERMAL["coal"]["efficiency"]
+    coal_co2_cost  = THERMAL["coal"]["emission_factor"] * eua
+    cv_coal        = coal_fuel_cost + coal_co2_cost
+
+    costs = {
+        "nuclear": np.full(n, VARIABLE_COSTS["nuclear"]),
+        "hydro":   np.full(n, VARIABLE_COSTS["hydro"]),
+        "oil":     np.full(n, VARIABLE_COSTS["oil"]),
+        "gas":     cv_gas,
+        "coal":    cv_coal,
+        # Renouvelables : coût marginal = 0 (appelés en priorité)
+        "wind":    np.zeros(n),
+        "solar":   np.zeros(n),
+    }
+    return costs
+
+
+def run_merit_order(
+    demand:     np.ndarray,
+    wind:       np.ndarray,
+    solar:      np.ndarray,
+    costs:      dict,
+    price_cap:  float = 3000.0,   # plafond réglementaire MIBEL/EPEX
+    price_floor: float = -500.0,  # plancher (prix négatifs possibles)
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Simule le merit order heure par heure.
+
+    Logique :
+    1. Les ENR (vent + soleil) sont appelées en priorité (coût ≈ 0)
+    2. La demande résiduelle = demande - ENR
+    3. Les autres technologies sont appelées du moins cher au plus cher
+    4. Le prix spot = coût variable de la DERNIÈRE technologie appelée
+       (technologie marginale)
+    5. Si la demande résiduelle est négative → prix négatif possible
+
+    Returns
+    -------
+    spot_price : np.ndarray   prix horaire (€/MWh)
+    dispatch   : dict         production horaire par technologie (MW)
+    """
+    n = len(demand)
+
+    # Ordre de mérite fixe (hors renouvelables déjà intégrés)
+    merit_stack = ["nuclear", "hydro", "coal", "gas", "oil"]
+
+    spot_price = np.zeros(n)
+    dispatch   = {tech: np.zeros(n) for tech in list(CAPACITIES.keys())}
+
+    for h in range(n):
+        # --- Étape 1 : appel des ENR (must-run, coût = 0) ---
+        dispatch["wind"][h]  = wind[h]
+        dispatch["solar"][h] = solar[h]
+        residual = demand[h] - wind[h] - solar[h]
+
+        if residual <= 0:
+            # Sur-production ENR → prix négatif
+            spot_price[h] = price_floor * min(abs(residual) / 5000, 1.0)
+            continue
+
+        # --- Étape 2 : appel des thermiques / pilotables ---
+        remaining = residual
+        marginal_cost = 0.0
+
+        for tech in merit_stack:
+            cap = CAPACITIES[tech] * AVAILABILITY.get(tech, 1.0)
+            cv  = costs[tech][h]
+
+            called = min(remaining, cap)
+            dispatch[tech][h] = called
+            remaining -= called
+
+            if called > 0:
+                marginal_cost = cv   # last technology sets the price
+
+            if remaining <= 0:
+                break
+
+        # --- Étape 3 : prix spot = coût de la marginale ---
+        if remaining > 0:
+            # Déficit d'offre → prix au plafond (VOLL)
+            spot_price[h] = price_cap
+        else:
+            spot_price[h] = marginal_cost
+
+    return spot_price, dispatch
